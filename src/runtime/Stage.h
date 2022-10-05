@@ -21,9 +21,7 @@ public:
     std::vector<KeySequence> outputs;
     std::vector<CommandOutput> command_outputs;
     std::string device_filter;
-
-    // negative means any device
-    int device_index{ -1 };
+    std::vector<unsigned int> device_indces;
   };
 
   explicit Stage(std::vector<Context> contexts);
