@@ -4,6 +4,7 @@
 
 struct Settings {
   bool verbose;
+  bool grab_and_exit;
 };
 
 #if defined(_WIN32)

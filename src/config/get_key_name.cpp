@@ -5,6 +5,22 @@
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <sstream>
+
+namespace {
+  Key try_parse_key_code(std::string_view name) {
+    if (name.size() >= 2 && (name[0] >= '0' && name[0] <= '9')) {
+      auto rest = char{ };
+      auto keycode = size_t{ };
+      auto ss = std::istringstream(std::string(name));
+      ss.unsetf(std::ios_base::basefield);
+      ss >> keycode >> rest;
+      if (ss.eof() && keycode > 0 && rest == 0 && keycode > 0 && keycode < 0xF000)
+        return static_cast<Key>(keycode);
+    }
+    return Key::none;
+  }
+} // namespace
 
 const char* get_key_name(const Key& key) {
   switch (key) {
@@ -119,6 +135,7 @@ const char* get_key_name(const Key& key) {
     case Key::DisplayToggleIntExt:return "DisplayToggleIntExt";
     case Key::Prog3:              return "Prog3";
     case Key::WLAN:               return "WLAN";
+    case Key::LaunchApp2:         return "LaunchApp2";
     case Key::AudioVolumeMute:    return "AudioVolumeMute";
     case Key::AudioVolumeDown:    return "AudioVolumeDown";
     case Key::AudioVolumeUp:      return "AudioVolumeUp";
@@ -144,6 +161,23 @@ const char* get_key_name(const Key& key) {
     case Key::MediaTrackPrevious: return "MediaTrackPrevious";
     case Key::MediaStop:          return "MediaStop";
     case Key::BrowserRefresh:     return "BrowserRefresh";
+    case Key::BrowserHome:        return "BrowserHome";
+    case Key::LaunchMail:         return "LaunchMail";
+    case Key::LaunchMediaPlayer:  return "LaunchMediaPlayer";
+    case Key::Again:              return "Again";
+    case Key::Props:              return "Props";
+    case Key::Undo:               return "Undo";
+    case Key::Select:             return "Select";
+    case Key::Copy:               return "Copy";
+    case Key::Open:               return "Open";
+    case Key::Paste:              return "Paste";
+    case Key::Find:               return "Find";
+    case Key::Cut:                return "Cut";
+    case Key::Help:               return "Help";
+    case Key::Sleep:              return "Sleep";
+    case Key::WakeUp:             return "WakeUp";
+    case Key::Eject:              return "Eject";
+    case Key::Fn:                 return "Fn";
     case Key::F13:                return "F13";
     case Key::F14:                return "F14";
     case Key::F15:                return "F15";
@@ -164,15 +198,19 @@ const char* get_key_name(const Key& key) {
     case Key::ButtonForward:      return "ButtonForward";
 
     case Key::any:                return "Any";
+    case Key::ContextActive:      return "ContextActive";
 
     case Key::none:
     case Key::timeout:
+    case Key::last_keyboard_key:
     case Key::first_virtual:
     case Key::last_virtual:
     case Key::first_logical:
     case Key::last_logical:
     case Key::first_action:
     case Key::last_action:
+    case Key::Control:
+    case Key::Meta:
       break;
   }
   return nullptr;
@@ -190,6 +228,9 @@ bool remove_prefix(std::string_view& name, const char(&literal)[SizeZ]) {
 Key get_key_by_name(std::string_view name) {
   if (name == "Any")
     return Key::any;
+
+  if (auto key = try_parse_key_code(name); key != Key::none)
+    return key;
 
   if (remove_prefix(name, "Virtual"))
     if (const auto n = std::atoi(name.data()); n >= 0)
@@ -222,6 +263,12 @@ Key get_key_by_name(std::string_view name) {
     [](const auto& kv, const auto& name) { return kv.first < name; });
   if (it != cend(s_key_map) && it->first == name)
     return it->second;
+
+  // allow some aliases
+  if (name == "OSLeft")
+    return Key::MetaLeft;
+  if (name == "OSRight")
+    return Key::MetaRight;
 
   return Key::none;
 }

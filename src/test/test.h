@@ -14,10 +14,14 @@ template<size_t N>
 KeySequence parse_sequence(const char(&input)[N]) {
   return parse_sequence(input, input + N - 1);
 }
+
+std::ostream& operator<<(std::ostream& os, const KeyEvent& event);
 std::string format_sequence(const KeySequence& sequence);
 std::string format_list(const std::vector<Key>& keys);
 
-Stage create_stage(const char* string);
+Stage create_stage(const char* string, bool activate_all_contexts = true);
 
-KeyEvent make_timeout_ms(int timeout_ms);
-KeyEvent make_not_timeout_ms(int timeout_ms);
+KeyEvent reply_timeout_ms(int timeout_ms);
+KeyEvent make_timeout_ms(int timeout_ms, bool cancel_on_up);
+KeyEvent make_not_timeout_ms(int timeout_ms, bool cancel_on_up);
+KeyEvent make_output_timeout_ms(int timeout_ms);

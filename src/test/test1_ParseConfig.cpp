@@ -9,16 +9,19 @@ namespace {
     return parse(stream);
   }
 
-  int find_context(const Config& config, const char* window_class, const char* window_title) {
+  int find_context(const Config& config, 
+      const char* window_class, 
+      const char* window_title, 
+      const char* window_path = "") {
     const auto& contexts = config.contexts;
     // skip default context
     const auto begin = std::next(contexts.begin());
     const auto end = contexts.end();
     const auto it = std::find_if(begin, end,
       [&](const Config::Context& context) {
-        return context.matches(window_class, window_title);
+        return context.matches(window_class, window_title, window_path);
       });
-    return (it == end ? 0 : std::distance(begin, it) + 1);
+    return static_cast<int>(it == end ? 0 : std::distance(begin, it) + 1);
   }
 } // namespace
 
@@ -49,6 +52,10 @@ TEST_CASE("Valid config", "[ParseConfig]") {
 //--------------------------------------------------------------------
 
 TEST_CASE("Problems", "[ParseConfig]") {
+  // input without Down
+  CHECK_THROWS(parse_config(R"(!A >> B)"));  
+  CHECK_THROWS(parse_config(R"(!A 100ms >> B)"));  
+
   // not mapped command
   auto string = R"(
     C >> CommandA
@@ -197,6 +204,25 @@ TEST_CASE("Problems", "[ParseConfig]") {
     CommandA >> D
   )";
   CHECK_THROWS(parse_config(string));
+
+  // context filters can optionally be separted with commas
+  string = R"(
+    [class = 'abc', title = "test"]
+    A >> B
+  )";
+  CHECK_NOTHROW(parse_config(string));
+
+  string = R"(
+    [class = 'abc',, title = "test"]
+    A >> B
+  )";
+  CHECK_THROWS(parse_config(string));
+
+  string = R"(
+    [class = 'abc', title = "test",]
+    A >> B
+  )";
+  CHECK_THROWS(parse_config(string));
 }
 
 //--------------------------------------------------------------------
@@ -219,8 +245,14 @@ TEST_CASE("System contexts", "[ParseConfig]") {
     [system="Windows" title="app1"]
     command >> Y
 
-    [title="app2"]
+    [system="MacOS"]
+    command >> M
+
+    [system="MacOS" title="app1"]
     command >> Z
+
+    [title="app2"]
+    command >> R
   )";
   auto config = parse_config(string);
 
@@ -240,12 +272,15 @@ TEST_CASE("System contexts", "[ParseConfig]") {
 #if defined(__linux__)
   REQUIRE(format_sequence(config.contexts[1].command_outputs[0].output) == "+L");
   REQUIRE(format_sequence(config.contexts[2].command_outputs[0].output) == "+X");
-#else
+#elif defined(_WIN32)
   REQUIRE(format_sequence(config.contexts[1].command_outputs[0].output) == "+W");
   REQUIRE(format_sequence(config.contexts[2].command_outputs[0].output) == "+Y");
+#else
+  REQUIRE(format_sequence(config.contexts[1].command_outputs[0].output) == "+M");
+  REQUIRE(format_sequence(config.contexts[2].command_outputs[0].output) == "+Z");
 #endif
 
-  REQUIRE(format_sequence(config.contexts[3].command_outputs[0].output) == "+Z");
+  REQUIRE(format_sequence(config.contexts[3].command_outputs[0].output) == "+R");
 }
 
 //--------------------------------------------------------------------
@@ -337,9 +372,94 @@ TEST_CASE("Context modifier", "[ParseConfig]") {
   REQUIRE(config.contexts[2].inputs.size() == 1);
   REQUIRE(config.contexts[3].inputs.size() == 1);
   CHECK(format_sequence(config.contexts[0].inputs[0].input) == "+A +C ~C ~A");
-  CHECK(format_sequence(config.contexts[1].inputs[0].input) == "+A +D ~D");
-  CHECK(format_sequence(config.contexts[2].inputs[0].input) == "!A +E ~E");
-  CHECK(format_sequence(config.contexts[3].inputs[0].input) == "+Virtual0 !Virtual1 +F ~F");
+  CHECK(format_sequence(config.contexts[0].modifier_filter) == "");
+  CHECK(format_sequence(config.contexts[1].inputs[0].input) == "+D ~D");
+  CHECK(format_sequence(config.contexts[1].modifier_filter) == "+A");
+  CHECK(format_sequence(config.contexts[2].inputs[0].input) == "+E ~E");
+  CHECK(format_sequence(config.contexts[2].modifier_filter) == "!A");
+  CHECK(format_sequence(config.contexts[3].inputs[0].input) == "+F ~F");
+  CHECK(format_sequence(config.contexts[3].modifier_filter) == "+Virtual0 !Virtual1");
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Context macro", "[ParseConfig]") {
+  auto string = R"(
+    DeviceA = /Device1/
+    TitleB = "Title1"
+
+    [device=DeviceA class = "A"]
+    A >> B
+
+    [title=TitleB device = DeviceB]
+    E >> F
+  )";
+
+  auto config = parse_config(string);
+  REQUIRE(config.contexts.size() == 2);
+  CHECK(config.contexts[0].device_filter == "/Device1/");
+  CHECK(config.contexts[0].window_class_filter.string == "A");
+  CHECK(config.contexts[1].device_filter == "DeviceB");
+  CHECK(config.contexts[1].window_title_filter.string == "Title1");
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Context with inverted filters", "[ParseConfig]") {
+  auto string = R"(
+    [device != DeviceA class!="A" title!="B" path!="C" modifier!=A]
+    A >> B
+  )";
+
+  auto config = parse_config(string);
+  REQUIRE(config.contexts.size() == 1);
+  CHECK(config.contexts[0].invert_device_filter);
+  CHECK(config.contexts[0].invert_modifier_filter);
+  CHECK(config.contexts[0].window_title_filter.invert);
+  CHECK(config.contexts[0].window_class_filter.invert);
+  CHECK(config.contexts[0].window_path_filter.invert);
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Context with fallthrough", "[ParseConfig]") {
+  auto string = R"(
+    [title = A]
+    A >> B
+
+    [title = B]  # fallthrough
+    [title = C]
+    A >> B
+
+    [title = D]  # removed
+    
+    [title = E]
+    A >> B
+
+    [title = F]  # removed
+    #A >> B
+    [title = G]
+    A >> B
+
+    [title = H]  # removed
+    [title = I]  # removed
+
+    [title = J]  # fallthrough
+    [system = "Linux"]   # two of
+    [system = "Windows"] # three
+    [system = "MacOS"]   # are removed
+    A >> B
+  )";
+
+  auto config = parse_config(string);
+  REQUIRE(config.contexts.size() == 7);
+  CHECK(!config.contexts[0].fallthrough); // A
+  CHECK(config.contexts[1].fallthrough);  // B fallthrough
+  CHECK(!config.contexts[2].fallthrough); // C
+  CHECK(!config.contexts[3].fallthrough); // E
+  CHECK(!config.contexts[4].fallthrough); // G
+  CHECK(config.contexts[5].fallthrough);  // J fallthrough
+  CHECK(!config.contexts[6].fallthrough); // System
 }
 
 //--------------------------------------------------------------------
@@ -347,8 +467,8 @@ TEST_CASE("Context modifier", "[ParseConfig]") {
 TEST_CASE("Macros", "[ParseConfig]") {
   auto string = R"(
     MyMacro = A{B}
-    MyMacro >> C
-    C >> MyMacro
+    MyMacro >> C # MyMacro
+    C >> MyMacro   # MyMacro
   )";
   auto config = Config{ };
   REQUIRE_NOTHROW(config = parse_config(string));
@@ -361,9 +481,9 @@ TEST_CASE("Macros", "[ParseConfig]") {
   CHECK(format_sequence(config.contexts[0].outputs[1]) == "+A +B -B -A");
 
   string = R"(
-    Macro1 = F
-    Macro2 = E Macro1 G
-    Macro3 =
+    Macro1 = F   # >
+    Macro2 = E Macro1 G  # Macro1
+    Macro3 =     # -
     Macro1 A Macro2 Macro3 >> Macro3 Macro2 B Macro1
   )";
   REQUIRE_NOTHROW(config = parse_config(string));
@@ -373,11 +493,200 @@ TEST_CASE("Macros", "[ParseConfig]") {
   CHECK(format_sequence(config.contexts[0].inputs[0].input) == "+F ~F +A ~A +E ~E +F ~F +G ~G");
   CHECK(format_sequence(config.contexts[0].outputs[0]) == "+E -E +F -F +G -G +B -B +F -F");
 
+  // do not substitute in string
+  string = R"(
+    ab = E F
+    X >> ab 'ab' ab
+  )";
+  REQUIRE_NOTHROW(config = parse_config(string));
+  REQUIRE(config.contexts[0].inputs.size() == 1);
+  REQUIRE(config.contexts[0].outputs.size() == 1);
+  REQUIRE(config.contexts[0].command_outputs.size() == 0);
+  CHECK(format_sequence(config.contexts[0].inputs[0].input) == "+X ~X");
+  CHECK(format_sequence(config.contexts[0].outputs[0]) == 
+    "+E -E +F -F !MetaLeft !MetaRight !ShiftLeft !ShiftRight !AltLeft !AltRight !ControlLeft !ControlRight +A -A +B -B +E -E +F -F");
+
   // not allowed macro name
   string = R"(
     Space = Enter
   )";
   CHECK_THROWS(parse_config(string));
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Macros and system filter", "[ParseConfig]") {
+  auto string = R"(
+    [system="Linux"]
+    Macro1 = C
+
+    [system="Windows"]
+    Macro1 = D
+
+    [system="MacOS"]
+    Macro1 = E
+
+    [system="MacOS"]
+    Macro2 = F
+
+    [system="Windows"]
+    Macro2 = G
+
+    [system="Linux"]
+    Macro2 = H
+
+    [default]
+    Macro1 >> X
+    Macro2 >> Y
+  )";
+  auto config = parse_config(string);
+
+  // contexts without mappings are removed
+  REQUIRE(config.contexts.size() == 1);
+  REQUIRE(config.contexts[0].inputs.size() == 2);
+
+#if defined(__linux__)
+  CHECK(format_sequence(config.contexts[0].inputs[0].input) == "+C ~C");
+  CHECK(format_sequence(config.contexts[0].inputs[1].input) == "+H ~H");
+#elif defined(_WIN32)
+  CHECK(format_sequence(config.contexts[0].inputs[0].input) == "+D ~D");
+  CHECK(format_sequence(config.contexts[0].inputs[1].input) == "+G ~G");
+#else
+  CHECK(format_sequence(config.contexts[0].inputs[0].input) == "+E ~E");
+  CHECK(format_sequence(config.contexts[0].inputs[1].input) == "+F ~F");
+#endif
+
+  // macro not defined on system
+  string = R"(
+    [system="Linux"]
+    Macro1 = C
+
+    [system="Windows"]
+    Macro2 = D
+
+    [system="MacOS"]
+    Macro3 = E
+
+    [default]
+    Macro1 >> X
+    Macro2 >> Y
+    Macro3 >> Y
+  )";
+  CHECK_THROWS(parse_config(string));
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Macros with arguments", "[ParseConfig]") {
+  auto string = R"(
+    modify = $0{ $1 }
+    print = "$0"
+    echo = $(echo "$0")
+    func = modify[$0 $2, $1]
+
+    A >> modify[ShiftLeft, X]
+    B >> print[X]
+    C >> print[ "a b" ]
+    E >> echo["Title"]
+    F >> func[X, Y, Z, W]
+    G >> func[X, Y]
+    H >> func[ , Y, (Z W)]
+    I >> func[ , Y Z, W]
+  )";
+  auto config = parse_config(string);
+
+  REQUIRE(config.contexts.size() == 1);
+  REQUIRE(config.contexts[0].inputs.size() == 8);
+  REQUIRE(config.contexts[0].outputs.size() == 8);
+
+  CHECK(format_sequence(config.contexts[0].outputs[0]) == "+ShiftLeft +X -X -ShiftLeft");
+
+  CHECK(format_sequence(config.contexts[0].outputs[1]) ==
+    "!MetaLeft !MetaRight +ShiftLeft !AltLeft !AltRight !ControlLeft !ControlRight "
+    "+X -X -ShiftLeft");
+
+  CHECK(format_sequence(config.contexts[0].outputs[2]) ==
+    "!MetaLeft !MetaRight !ShiftLeft !ShiftRight !AltLeft !AltRight !ControlLeft !ControlRight "
+    "+A -A +Space -Space +B -B");
+
+  CHECK(format_sequence(config.contexts[0].outputs[3]) == "+Action0");
+
+  CHECK(format_sequence(config.contexts[0].outputs[4]) == "+X -X +Z +Y -Y -Z");
+  CHECK(format_sequence(config.contexts[0].outputs[5]) == "+X +Y -Y -X");
+  CHECK(format_sequence(config.contexts[0].outputs[6]) == "+Z +W +Y -Y -W -Z");
+  CHECK(format_sequence(config.contexts[0].outputs[7]) == "+W +Y -Y +Z -Z -W");
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Macros with arguments - Problems", "[ParseConfig]") {
+  CHECK_NOTHROW(parse_config(R"( 
+    macro = $0 
+    A >> macro[]
+  )"));
+  CHECK_NOTHROW(parse_config(R"( 
+    macro = $0 
+    A >> macro[,]
+  )"));
+  CHECK_THROWS(parse_config(R"( 
+    macro = $0 
+    A >> macro["]
+  )"));
+  CHECK_THROWS(parse_config(R"( 
+    macro = $0 
+    A >> macro[']
+  )"));
+  CHECK_THROWS(parse_config(R"( 
+    macro = $0 
+    A >> macro[,']
+  )"));
+  CHECK_THROWS(parse_config(R"( 
+    macro = $0 
+    A >> macro[$]
+  )"));
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Macros with Alias arguments", "[ParseConfig]") {
+  auto string = R"(
+    twice = $0 $0
+    Boss = Virtual1
+    A >> twice[X]
+    B >> twice[Boss]
+  )";
+  auto config = parse_config(string);
+  REQUIRE(config.contexts.size() == 1);
+  REQUIRE(config.contexts[0].outputs.size() == 2);
+  CHECK(format_sequence(config.contexts[0].outputs[0]) == "+X -X +X -X");
+  CHECK(format_sequence(config.contexts[0].outputs[1]) == "+Virtual1 -Virtual1 +Virtual1 -Virtual1");
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Macros with Terminal Commands", "[ParseConfig]") {
+  auto string = R"(
+    notify = $(notify-send -t 2000 -a "keymapper" "$0")
+    F1 >> notify["F7"]
+
+    echo = $(echo $0$1)
+    F2 >> echo[echo]
+    F3 >> echo[" echo "]
+    F4 >> echo["echo, echo"]
+    F5 >> echo["echo", " echo "]
+    F6 >> $(echo "echo")
+  )";
+  auto config = parse_config(string);
+  REQUIRE(config.actions.size() == 6);
+
+  CHECK(config.actions[0].terminal_command == R"(notify-send -t 2000 -a "keymapper" "F7")");
+  // in strings only $0... are substituted
+  CHECK(config.actions[1].terminal_command == R"(echo $(echo $0$1))");
+  CHECK(config.actions[2].terminal_command == R"(echo  echo )");
+  CHECK(config.actions[3].terminal_command == R"(echo echo, echo)");
+  CHECK(config.actions[4].terminal_command == R"(echo echo echo )");
+  // in terminal commands macros are also substituted
+  CHECK(config.actions[5].terminal_command == R"($(echo $0$1) "echo")");
 }
 
 //--------------------------------------------------------------------
@@ -461,6 +770,7 @@ TEST_CASE("Logical keys", "[ParseConfig]") {
   CHECK_THROWS(parse_config("A >> B | C"));
   CHECK_THROWS(parse_config("A | B >> C"));
 }
+
 //--------------------------------------------------------------------
 
 TEST_CASE("Logical keys 2", "[ParseConfig]") {
@@ -478,5 +788,64 @@ TEST_CASE("Logical keys 2", "[ParseConfig]") {
   REQUIRE(format_sequence(config.contexts[0].outputs[1]) == "+ShiftRight +B -B -ShiftRight");
 }
 
+TEST_CASE("Logical keys in context filter", "[ParseConfig]") {
+  auto string = R"(
+    Mod = A | B | C
+    
+    [modifier = "Mod"] # 2 fallthrough contexts
+    R >> X
+    
+    [modifier = "!Mod"]
+    S >> Y
+    
+    [default]
+    T >> Z
+  )";
+
+  auto config = parse_config(string);
+  REQUIRE(config.contexts.size() == 5);
+  REQUIRE(config.contexts[0].fallthrough);
+  REQUIRE(config.contexts[0].inputs.empty());
+  REQUIRE(config.contexts[1].fallthrough);
+  REQUIRE(config.contexts[1].inputs.empty());
+  REQUIRE(!config.contexts[2].fallthrough);
+  REQUIRE(config.contexts[2].inputs.size() == 1);
+  REQUIRE(!config.contexts[3].fallthrough);
+  REQUIRE(config.contexts[3].inputs.size() == 1);
+  REQUIRE(!config.contexts[4].fallthrough);
+  REQUIRE(config.contexts[4].inputs.size() == 1);
+  REQUIRE(format_sequence(config.contexts[0].modifier_filter) == "+A");
+  REQUIRE(format_sequence(config.contexts[1].modifier_filter) == "+B");
+  REQUIRE(format_sequence(config.contexts[2].modifier_filter) == "+C");
+  REQUIRE(format_sequence(config.contexts[3].modifier_filter) == "!A !B !C");
+  REQUIRE(format_sequence(config.contexts[4].modifier_filter) == "");
+}
+
 //--------------------------------------------------------------------
 
+TEST_CASE("String escape sequence", "[ParseConfig]") {
+  auto string = R"(
+    A >> '\nnt\t'
+    B >> $(echo "a\nb")
+  )";
+
+  auto config = parse_config(string);
+  REQUIRE(config.contexts.size() == 1);
+  REQUIRE(config.contexts[0].outputs.size() == 2);
+  CHECK(format_sequence(config.contexts[0].outputs[0]) == 
+    "!MetaLeft !MetaRight !ShiftLeft !ShiftRight !AltLeft !AltRight !ControlLeft !ControlRight "
+    "+Enter -Enter +N -N +T -T +Tab -Tab");
+
+  REQUIRE(config.actions.size() == 1);
+  CHECK(config.actions[0].terminal_command == R"(echo "a\nb")");
+}
+
+//--------------------------------------------------------------------
+
+TEST_CASE("Complex terminal commands", "[ParseConfig]") {
+  auto string = R"(
+    F1 >> $(i3-open -c Telegram "gtk-launch $(basename $(rg -l Telegram $HOME/.local/share/applications)) ")
+  )";
+  auto config = parse_config(string);
+  REQUIRE(config.actions.size() == 1);
+}

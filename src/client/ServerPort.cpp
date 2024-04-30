@@ -1,15 +1,12 @@
 
 #include "ServerPort.h"
-#include "config/Config.h"
 #include "common/MessageType.h"
 
 namespace {
   void write_key_sequence(Serializer& s, const KeySequence& sequence) {
     s.write(static_cast<uint32_t>(sequence.size()));
-    for (const auto& event : sequence) {
-      s.write(event.key);
-      s.write(event.data);
-    }
+    for (const auto& event : sequence)
+      s.write(event);
   }
 
   void write_config(Serializer& s, const Config& config) {
@@ -37,6 +34,14 @@ namespace {
       // device filter
       s.write(static_cast<uint32_t>(context.device_filter.size()));
       s.write(context.device_filter.data(), context.device_filter.size());
+      s.write(context.invert_device_filter);
+      
+      // modifier filter
+      write_key_sequence(s, context.modifier_filter);
+      s.write(context.invert_modifier_filter);
+
+      // fallthrough
+      s.write(context.fallthrough);
     }
   }
 
@@ -47,45 +52,78 @@ namespace {
   }
 } // namespace
 
-ServerPort::ServerPort() = default;
-ServerPort::~ServerPort() = default;
-
-Connection::Socket ServerPort::socket() const {
-  return (m_connection ? m_connection->socket() : Connection::invalid_socket);
+ServerPort::ServerPort() 
+  : m_host("keymapper") {
 }
 
-bool ServerPort::initialize() {
-  auto connection = std::make_unique<Connection>();
-  if (!connection->connect())
-    return false;
+bool ServerPort::connect() {
+  m_connection = m_host.connect();
+  return static_cast<bool>(m_connection);
+}
 
-  m_connection = std::move(connection);
-  return true;
+void ServerPort::disconnect() {
+  m_connection.disconnect();
 }
 
 bool ServerPort::send_config(const Config& config) {
-  return m_connection && m_connection->send_message([&](Serializer& s) {
+  return m_connection.send_message([&](Serializer& s) {
     s.write(MessageType::configuration);
     write_config(s, config);
   });
 }
 
 bool ServerPort::send_active_contexts(const std::vector<int>& indices) {
-  return m_connection && m_connection->send_message([&](Serializer& s) {
+  return m_connection.send_message([&](Serializer& s) {
     s.write(MessageType::active_contexts);
     write_active_contexts(s, indices);
   });
 }
 
 bool ServerPort::send_validate_state() {
-  return m_connection && m_connection->send_message([&](Serializer& s) {
+  return m_connection.send_message([&](Serializer& s) {
     s.write(MessageType::validate_state);
   });
 }
 
-bool ServerPort::receive_triggered_action(Duration timeout, int* triggered_action) {
-  return m_connection && m_connection->read_messages(timeout,
-    [&](Deserializer& s) {
-      *triggered_action = static_cast<int>(s.read<uint32_t>());
+bool ServerPort::send_set_virtual_key_state(Key key, KeyState state) {
+  return m_connection.send_message([&](Serializer& s) {
+    s.write(MessageType::set_virtual_key_state);
+    s.write(key);
+    s.write(state);
+  });
+}
+
+bool ServerPort::send_request_device_names() {
+  return m_connection.send_message([&](Serializer& s) {
+    s.write(MessageType::device_names);
+  });
+}
+
+bool ServerPort::read_messages(MessageHandler& handler,
+    std::optional<Duration> timeout) {
+  return m_connection.read_messages(timeout,
+    [&](Deserializer& d) {
+      switch (d.read<MessageType>()) {
+        case MessageType::execute_action: {
+          handler.on_execute_action_message(
+            static_cast<int>(d.read<uint32_t>()));
+          break;
+        }
+        case MessageType::virtual_key_state: {
+          const auto key = d.read<Key>();
+          const auto state = d.read<KeyState>();
+          handler.on_virtual_key_state_message(key, state);
+          break;
+        }
+        case MessageType::device_names: {
+          const auto count = d.read<size_t>();
+          auto device_names = std::vector<std::string>();
+          for (auto i = 0u; i < count; ++i)
+            device_names.push_back(d.read_string());
+          handler.on_device_names_message(std::move(device_names));
+          break;
+        }
+        default: break;
+      }
     });
 }

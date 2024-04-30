@@ -2,10 +2,21 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <optional>
 #include <type_traits>
 #include "Duration.h"
+
+#if defined(_WIN32)
+using Socket = uintptr_t;
+#else
+using Socket = int;
+#endif
+
+constexpr Socket invalid_socket = ~Socket{ };
+
+bool block_until_readable(Socket socket, std::optional<Duration> timeout);
 
 class Serializer {
 public:
@@ -15,9 +26,14 @@ public:
     std::memcpy(buffer.data() + offset, data, size);
   }
 
-  template<typename T, typename = std::enable_if_t<std::is_trivial_v<T>>>
+  template<typename T, typename = std::enable_if_t<std::is_trivially_copyable_v<T>>>
   void write(const T& value) {
     write(&value, sizeof(T));
+  }
+
+  void write(std::string_view string) {
+    write(static_cast<uint32_t>(string.size()));
+    write(string.data(), string.size());
   }
 
 private:
@@ -28,28 +44,35 @@ private:
 class Deserializer {
 public:
   void read(void* data, size_t size) {
-    if (can_read(size)) {
+    if (size && can_read(size)) {
       std::memcpy(data, &*it, size);
       it += size;
     }
   }
 
-  template<typename T, typename = std::enable_if_t<std::is_trivial_v<T>>>
+  template<typename T, typename = std::enable_if_t<std::is_trivially_copyable_v<T>>>
   T read() {
     auto result = T{ };
     read(&result, sizeof(T));
     return result;
   }
 
-  template<typename T, typename = std::enable_if_t<std::is_trivial_v<T>>>
+  template<typename T, typename = std::enable_if_t<std::is_trivially_copyable_v<T>>>
   void read(T* data) {
     read(data, sizeof(T));
   }
 
-  bool can_read(size_t length) const { 
-    return (length > 0 && 
-            it - buffer.begin() + length <= buffer.size()); 
+  std::string read_string() {
+    const auto size = read<uint32_t>();
+    auto result = std::string(size, ' ');
+    read(result.data(), size);
+    return result;
   }
+
+  bool can_read(size_t length) const { 
+    return (it - buffer.begin() + length <= buffer.size()); 
+  }
+
 private:
   friend class Connection;
   std::vector<char> buffer;
@@ -59,24 +82,17 @@ private:
 class Connection {
   using Size = uint32_t;
 public:
-#if defined(_WIN32)
-  using Socket = uintptr_t;
-#else
-  using Socket = int;
-#endif
-  static const Socket invalid_socket;
-
-  Connection();
-  Connection(const Connection&) = delete;
-  Connection& operator=(const Connection&) = delete;
+  Connection() = default;
+  explicit Connection(Socket socket);
+  Connection(Connection&& rhs);
+  Connection& operator=(Connection&& rhs);
   ~Connection();
-  Socket socket() const { return m_socket_fd; }
-  Socket listen_socket() const { return m_listen_fd; }
 
-  bool listen();
-  bool accept();
-  bool connect();
+  Socket socket() const { return m_socket_fd; }
+  explicit operator bool() const { return m_socket_fd != invalid_socket; }
   void disconnect();
+  bool send(const char* buffer, size_t length);
+  int recv(char* buffer, size_t length);
 
   template<typename F> // void(Serializer&)
   bool send_message(F&& write_message) {
@@ -121,14 +137,10 @@ public:
   }
 
 private:
-  void make_non_blocking();
   bool wait_for_message(std::optional<Duration> timeout);
-  bool send(const char* buffer, size_t length);
-  int recv(char* buffer, size_t length);
   bool recv(std::vector<char>& buffer);
 
-  Socket m_socket_fd{ ~Socket() };
-  Socket m_listen_fd{ ~Socket() };
+  Socket m_socket_fd{ invalid_socket };
   Serializer m_serializer;
   Deserializer m_deserializer;
 };

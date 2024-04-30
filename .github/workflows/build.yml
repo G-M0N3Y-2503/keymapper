@@ -19,8 +19,14 @@ jobs:
           - os: windows-latest
             package: WIX
 
-          - os: ubuntu-18.04
+          - os: ubuntu-22.04
             package: TGZ
+            
+          - os: ubuntu-22.04
+            package: DEB
+
+          - os: ubuntu-22.04
+            package: RPM
 
     steps:
     - name: Setup Windows/MSVC
@@ -29,14 +35,11 @@ jobs:
       with:
         arch: amd64_x86
 
-    - name: Setup Linux/gcc-8
+    - name: Setup Linux
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install libudev-dev libusb-1.0-0-dev libx11-dev libdbus-1-dev libwayland-dev
-        sudo apt-get install g++-8
-        echo 'CC=gcc-8' >> $GITHUB_ENV
-        echo 'CXX=g++-8' >> $GITHUB_ENV
+        sudo apt-get install libudev-dev libusb-1.0-0-dev libx11-dev libdbus-1-dev libwayland-dev libxkbcommon-dev libgtk-3-dev libappindicator3-dev rpm
 
     - name: Checkout
       uses: actions/checkout@v2
@@ -58,6 +61,6 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        file: "*.zip;*.tar.gz;*.msi"
+        file: "*.zip;*.tar.gz;*.msi;*.deb;*.rpm"
         tags: true
         draft: false

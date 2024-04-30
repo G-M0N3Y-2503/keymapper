@@ -17,12 +17,14 @@ keymapper
 
 A cross-platform context-aware key remapper. It allows to:
 
-* Redefine keyboard shortcuts system-wide or per application.
+* Redefine your keyboard layout and shortcuts systemwide or per application.
 * Manage all your keyboard shortcuts in a single configuration file.
 * Change shortcuts for similar actions in different applications at once.
-* Share configuration files between multiple systems (GNU/Linux, Windows).
-* Bind keyboard shortcuts to terminal commands.
-* Use mouse buttons in your mappings.
+* Share configuration files between multiple systems (GNU/Linux, Windows, MacOS).
+* Specify the output as [characters](#character-typing) instead of the keys required to type them.
+* Bind keyboard shortcuts to [launch applications](#application-launching).
+* Control the state from external applications using [keymapperctl](#keymapperctl).
+* Use [mouse buttons](#key-names) in your mappings.
 
 Configuration
 -------------
@@ -38,9 +40,9 @@ Control{Q} >> Alt{F4}
 ```
 
 Unless overridden using the command line argument `-c`, the configuration is read from `keymapper.conf`, which is looked for in the common places and in the working directory:
-  * on Linux in `$HOME/.config/` and `/etc/`.
+  * on Linux and MacOS in `$HOME/.config/` and `/etc/`.
   * on Windows in the user's profile, `AppData\Local` and `AppData\Roaming` folders.
- 
+
 The command line argument `-u` causes the configuration to be automatically reloaded whenever the configuration file changes.
 
 :warning: **In case of emergency:** You can always press the special key combination <kbd>Shift</kbd>+<kbd>Escape</kbd>+<kbd>K</kbd> to terminate `keymapperd`.
@@ -52,6 +54,8 @@ The names have been chosen to match on what the [web browsers](https://developer
 For convenience the letter and digits keys are also named `A` to `Z` and `0` to `9`. The logical keys `Shift`, `Control` and `Meta` are also defined (each matches the left and right modifier keys). There are also [virtual keys](#virtual-keys) for state switching, an [Any key](#any-key) and a [No key](#no-key).
 
 The mouse buttons are named: `ButtonLeft`, `ButtonRight`, `ButtonMiddle`, `ButtonBack` and `ButtonForward`.
+
+It is also possible to directly provide the scan code instead of the key name in decimal or hex notation (e.g. `159`, `0x9F`).
 
 :warning: Beware that the configuration file is **case sensitive**.
 
@@ -73,8 +77,9 @@ The output expression format is analogous to the input expression format:
   * `(A B)` means that both keys are pressed simultaneously.
   * `A{B}` means that a key is hold while another is pressed.
   * `!A` means that the (potentially pressed) key should be released before the rest of the expression is applied.
-  * `^` splits the output in two parts, one which is applied when the input is pressed and one when it is released (see [further explanation](#Output-on-key-release)).
-  * `$()` can be used for [terminal command binding](#terminal-command-binding).
+  * `^` splits the output in two parts, one which is applied when the input key is pressed and one when the [key is released](#output-on-key-release).
+  * Strings enclosed in single or double quotes specify [characters to type](#character-typing).
+  * `$()` can be used for [launching applications](#application-launching).
   * An empty expression can be used to suppress any output.
 
 ### Order of mappings
@@ -105,41 +110,36 @@ For a detailed description of how the mapping is applied, see the [Functional pr
 
 ### Context awareness
 
-Context blocks allow to enable mappings only in specific contexts. A context can be defined by _system_, window _title_ or window _class_. They are opened like:
-
-```bash
-[system="Windows" title="..." class="..."]
-```
-
+Context blocks allow to enable mappings only in specific contexts. A context can be defined by `system`, the focused window `title`, window `class`, process `path` or the input `device` an event originates from.\
 A block continues until the next block (respectively the end of the file). The block which applies in all contexts can be reopened using `default`. e.g.:
 
 ```bash
 [default]
-CapsLock >> Backspace
 
-[title="Visual Studio"]
-Control{B} >> (Shift Control){B}
+[title = "Visual Studio"]
 
-[system="Linux" class="qtcreator"]
-...
+[system = "Linux" class != "qtcreator"] # '!=' inverses a condition
+
+[system = "Windows", path = "notepad.exe"] # comma is optional
+
+[device = "Some Device Name"] # consecutive blocks share mappings
+[device = "Other Device"]
 ```
 
-The title filter matches windows _containing_ the string in the title, the class filter only matches windows with the _exact_ class name. For finer control [regular expressions](https://en.wikipedia.org/wiki/Regular_expression) can be used. These have to be delimited with slashes. Optionally `i` can be appended to make the comparison case insensitive:
+:warning: The `device` filter on Windows requires the installation of a [virtual device driver](#virtual-device-driver). The process `path` may not be available on Wayland and for processes with higher privileges. The window `title` is not available on MacOS.
+
+Class and device filters match contexts with the _exact_ same string, others match contexts _containing_ the string.
+For finer control [regular expressions](https://en.wikipedia.org/wiki/Regular_expression) can be used. These have to be delimited with slashes. Optionally `i` can be appended to make the comparison case insensitive:
 
 ```javascript
-[title=/Visual Studio Code|Code OSS/i]
+[title = /Visual Studio Code|Code OSS/i]
 ```
 
-Additionally a common `modifier` for all the block's input expressions can be defined:
+Additionally a `modifier` filter allows to activate blocks depending on the state of one or more keys:
 
 ```bash
-[modifier="CapsLock"]
-K >> ArrowDown          # the same as "CapsLock{K} >> ArrowDown"
-```
-
-On Linux systems it is also possible to apply mappings when the input originates from a specific device:
-```javascript
-[device="Some Device Name"]
+# active when Virtual1 is down and Virtual2 is not
+[modifier = "Virtual1 !Virtual2"]
 ```
 
 ### Abstract commands
@@ -176,7 +176,7 @@ A >> ^B
 
 ### Virtual keys
 
-`Virtual0` to `Virtual9` are virtual keys, which can be used as state switches. They are toggled when used in output expressions and can be used as modifiers in input expressions:
+`Virtual0` to `Virtual255` are virtual keys, which can be used as state switches. They are toggled when used in output expressions and can be used as modifiers in input expressions:
 
 ```bash
 # Virtual1 is toggled whenever ScrollLock is pressed
@@ -187,6 +187,17 @@ Virtual1{A} >> B
 
 # map E to F when Virtual1 is NOT down
 !Virtual1 E >> F
+
+# keep G hold as long as Virtual1 is down
+Virtual1 >> G
+```
+
+`ContextActive` exists separately for each context and is toggled when the context becomes active/inactive:
+
+```bash
+# toggle Virtual1 when entering and when leaving context
+[title="Firefox"]
+ContextActive >> Virtual1 ^ Virtual1
 ```
 
 ### Any key
@@ -200,14 +211,13 @@ Control{Any} >> Shift{Any}
 Shift{Any} >> Control{Any}
 ```
 
-This can for example be used to exclude an application from mapping:
+To exclude an application from any mapping this can be added to the top of the configuration:
 
 ```bash
 [title="Remote Desktop"]
 Any >> Any
 
 [default]
-...
 ```
 
 ### No key
@@ -225,6 +235,23 @@ Control{!250ms} >> Escape
 A !250ms B >> C
 ```
 
+In output expressions it can be used to delay output or keep a key hold for a while. e.g:
+
+```bash
+A >> B 500ms C{1000ms}
+```
+
+### Character typing
+
+Output expressions can contain string literals with characters to type. The typeable characters depend on your keyboard layout. e.g:
+
+```bash
+AltRight{A} >> '@'
+Meta{A} K >> "Kind regards,\nDouglas Quaid"
+```
+
+:warning: The keyboard layout is evaluated when the configuration is loaded, switching is not yet supported.
+
 ### Key aliases
 
 For convenience aliases for keys and even sequences can be defined. e.g.:
@@ -234,18 +261,49 @@ Win = Meta
 Boss = Virtual1
 Alt = AltLeft | AltRight
 FindNext = Control{F3}
-Greet = H E L L O
+Proceed = Tab Tab Enter
+Greet = "Hello"
 ```
 
-### Terminal command binding
+Aliases can also be parameterized. The arguments are provided in square brackets and can be referenced by `$0`, `$1`... e.g.:
+```
+print = $(echo $0 $1 >> ~/keymapper.txt)
+F1 >> print["pressed the key", F1]
+```
 
-`$()` can be used in output expressions to embed terminal commands, which should be executed when the output is triggered:
+### Application launching
+
+`$()` can be used in output expressions to embed commands, which should be executed when it is triggered. e.g.:
 
 ```bash
+Meta{C} >> $(C:\windows\system32\calc.exe) ^
 Meta{W} >> $(exo-open --launch WebBrowser) ^
+
+# on Windows console applications are revealed by prepending 'start'
+Meta{C} >> $(start powershell) ^
 ```
 
 :warning: You may want to append `^` to ensure that the command is not executed repeatedly as long as the input is kept hold.
+
+### keymapperctl
+
+The application `keymapperctl` allows to communicate with the running `keymapper` process.
+It can be run arbitrarily often with one or more of the following arguments:
+```
+  --is-pressed <key>    sets the result code 0 when a virtual key is down.
+  --is-released <key>   sets the result code 0 when a virtual key is up.
+  --press <key>         presses a virtual key.
+  --release <key>       releases a virtual key.
+  --toggle <key>        toggles a virtual key.
+  --wait-pressed <key>  waits until a virtual key is pressed.
+  --wait-released <key> waits until a virtual key is released.
+  --wait-toggled <key>  waits until a virtual key is toggled.
+  --timeout <millisecs> sets a timeout for the following operation.
+  --wait <millisecs>    unconditionally waits a given amount of time.
+  --instance <id>       replaces another keymapperctl process with the same id.
+  --restart             starts processing the first operation again.
+  --stdout              writes the result code to stdout.
+```
 
 Example configuration
 ---------------------
@@ -267,33 +325,43 @@ Installation
 ------------
 The program is split into two parts:
 * `keymapperd` is the service which needs to be given the permissions to grab the keyboard devices and inject keys.
-* `keymapper` loads the configuration, informs the service about it and the active context and also executes mapped terminal commands.
+* `keymapper` should be run as normal user in a graphical environment. It loads the configuration, informs the service about it and the active context and also executes mapped terminal commands.
 
 For security and efficiency reasons, the communication between the two parts is kept as minimal as possible.
 
+The command line argument `-v` can be passed to both processes to output verbose logging information to the console.
+
 ### Linux
-`keymapperd` should be started as a service and `keymapper` as normal user within an X11 or Wayland session (currently the [GNOME Shell](https://en.wikipedia.org/wiki/GNOME_Shell) and [wlroots-based Wayland compositors](https://wiki.archlinux.org/title/Wayland#Compositors) are supported).
 
-**Arch Linux and derivatives:**
+Pre-built packages can be downloaded from the [latest release](https://github.com/houmain/keymapper/releases/latest) page. Arch Linux users can install an up to date build from the [AUR](https://aur.archlinux.org/packages/?K=keymapper).
 
-An up to date build can be installed from the [AUR](https://aur.archlinux.org/packages/?K=keymapper).
-
-To try it out, simply create a [configuration](#configuration) file and start it using:
+After installation you can try it out by creating a [configuration](#configuration) file and starting it using:
 ```
-systemctl start keymapperd
+sudo systemctl start keymapperd
 keymapper
 ```
 
-To install permanently, enable the `keymapperd` service and add `keymapper` to the desktop environment's auto-started applications.
-
-**Other Linux distributions:**
-
-No packages are provided yet, please follow the instructions for [building manually](#Building) or download a portable build from the [latest release](https://github.com/houmain/keymapper/releases/latest) page.
-
-To try it out, simply create a [configuration](#configuration) file and start it using:
+To install permanently, add `keymapper` to the desktop environment's auto-started applications and enable the `keymapperd` service:
 ```
-sudo ./keymapperd &
-./keymapper
+sudo systemctl enable keymapperd
+```
+
+To make context awareness work under Wayland, the compositor has to inform `keymapper` about the focused window. For [wlroots-based](https://wiki.archlinux.org/title/Wayland#Compositors) compositors this works out of the box, other compositors need to send the information using the [D-Bus](https://freedesktop.org/wiki/Software/dbus/) interface. A [GNOME Shell extension](https://github.com/houmain/keymapper/tree/main/extra/share/gnome-shell/extensions/keymapper%40houmain.github.com) and a [KWin script](https://github.com/houmain/keymapper/tree/main/extra/share/kwin/scripts/keymapper) are provided doing this.
+
+### MacOS
+
+The MacOS build depends on version 3.1.0 of [Karabiner-Element's](https://karabiner-elements.pqrs.org) virtual device driver.
+One can install it either directly from [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice/releases) or along with [Karabiner Elements](https://github.com/pqrs-org/Karabiner-Elements/releases) 14.13.0.
+
+A [Homebrew](https://brew.sh) formula is provided for building and installing keymapper:
+```
+brew tap houmain/tap
+brew install --HEAD keymapper
+```
+
+Finally `keymapperd` and `keymapper` can be added to the `launchd` daemons/agents by calling:
+```
+sudo keymapper-launchd add
 ```
 
 ### Windows
@@ -301,7 +369,11 @@ An installer and a portable build can be downloaded from the [latest release](ht
 
 The installer configures the Windows task scheduler to start `keymapper.exe` and `keymapperd.exe` at logon.
 
-To use the portable build, simply create a [configuration](#configuration) file and start both `keymapper.exe` and `keymapperd.exe`. It is advisable to start `keymapperd.exe` with elevated privileges. Doing not so has a few limitations. Foremost the Windows key cannot be mapped reliably and applications which are running as administrator (like the task manager, ...) resist any mapping.
+To use the portable build, simply create a [configuration](#configuration) file and start both `keymapper.exe` and `keymapperd.exe`. It is advisable to start `keymapperd.exe` with elevated privileges. Doing not so has a few limitations. Foremost the Windows key cannot be mapped reliably and applications which are running as administrator (like the task manager) resist any mapping.
+
+#### Virtual device driver
+
+The [device](#context-awareness) filter requires the installation of a virtual device driver. The only known freely available is [Interception](https://github.com/oblitum/Interception), which unfortunately has a [severe bug](https://github.com/oblitum/Interception/issues/25), that makes devices stop working after being dis-connected too often. Until this is fixed it not advisable to use it and it should only be installed when filtering by device is absolutely required. The `interception.dll` needs to be placed next to the `keymapperd.exe`.
 
 Building
 --------
@@ -311,7 +383,7 @@ A C++17 conforming compiler is required. A script for the
 
 **Installing dependencies on Debian Linux and derivatives:**
 ```
-sudo apt install build-essential git cmake libudev-dev libusb-1.0-0-dev libx11-dev libdbus-1-dev libwayland-dev
+sudo apt install build-essential git cmake libudev-dev libusb-1.0-0-dev libx11-dev libdbus-1-dev libwayland-dev libxkbcommon-dev libgtk-3-dev libappindicator3-dev
 ```
 
 **Checking out the source:**
@@ -326,7 +398,21 @@ cmake -B build
 cmake --build build
 ```
 
+**Testing:**
+
+To try it out, simply create a [configuration](#configuration) file and start it using:
+
+```
+sudo build/keymapperd -v
+```
+
+and
+
+```
+build/keymapper -v
+```
+
+
 License
 -------
-
 It is released under the GNU GPLv3. It comes with absolutely no warranty. Please see `LICENSE` for license details.

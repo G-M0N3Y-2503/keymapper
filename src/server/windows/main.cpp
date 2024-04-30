@@ -1,52 +1,53 @@
 
 #include "server/Settings.h"
-#include "server/ClientPort.h"
-#include "server/ButtonDebouncer.h"
-#include "server/verbose_debug_io.h"
-#include "runtime/Stage.h"
-#include "runtime/Key.h"
+#include "server/ServerState.h"
 #include "runtime/Timeout.h"
 #include "common/windows/LimitSingleInstance.h"
 #include "common/output.h"
+#include "Devices.h"
 #include <WinSock2.h>
 
 namespace {
-  // Calling SendMessage directly from mouse hook proc seems to trigger a
+  class ServerStateImpl final : public ServerState {
+    bool on_send_key(const KeyEvent& event) override;
+    void on_flush_scheduled(Duration delay) override;
+    void on_timeout_scheduled(Duration timeout) override;
+    void on_timeout_cancelled() override;
+    void on_exit_requested() override;
+    bool on_validate_key_is_down(Key key) override;
+    void on_device_names_message() override;
+  };
+  
+  // Calling SendInput directly from mouse hook proc seems to trigger a
   // timeout, therefore it is called after returning from the hook proc. 
   // But for keyboard input it is still more reliable to call it directly!
   const auto TIMER_FLUSH_SEND_BUFFER = 1;
   const auto TIMER_TIMEOUT = 2;
   const auto WM_APP_CLIENT_MESSAGE = WM_APP + 0;
+  const auto WM_APP_DEVICE_INPUT = WM_APP + 1;
   const auto injected_ident = ULONG_PTR(0xADDED);
 
   HINSTANCE g_instance;
   HWND g_window;
-  ClientPort g_client;
-  ButtonDebouncer g_button_debouncer;
-  std::unique_ptr<Stage> g_stage;
-  std::unique_ptr<Stage> g_new_stage;
-  const std::vector<int>* g_new_active_contexts;
   HHOOK g_keyboard_hook;
   HHOOK g_mouse_hook;
-  bool g_sending_key;
-  std::vector<KeyEvent> g_send_buffer;
-  std::vector<KeyEvent> g_send_buffer_on_release;
-  bool g_output_on_release;
-  bool g_flush_scheduled;
-  KeyEvent g_last_key_event;
-  std::chrono::milliseconds g_timeout_ms;
-  std::optional<Clock::time_point> g_timeout_start_at;
-
-  void apply_updates();
-  bool translate_input(KeyEvent input);
+  std::vector<Key> g_buttons_down;
+  Devices g_devices;
+  ServerStateImpl g_state;
 
   KeyEvent get_key_event(WPARAM wparam, const KBDLLHOOKSTRUCT& kbd) {
     // ignore unknown events
     if (kbd.scanCode > 0xFF)
       return { };
 
-    auto key_code = (kbd.scanCode |
-      (kbd.flags & LLKHF_EXTENDED ? 0xE000 : 0));
+    auto key_code = (kbd.scanCode ? 
+      kbd.scanCode : MapVirtualKeyW(kbd.vkCode, MAPVK_VK_TO_VSC));
+
+    if (!key_code)
+      return { };
+
+    if (kbd.flags & LLKHF_EXTENDED)
+      key_code |= 0xE000;
 
     // special handling
     if (key_code == 0xE036)
@@ -78,7 +79,23 @@ namespace {
     }
     return key;
   }
-  
+
+  bool prevent_button_repeat(const KeyEvent& event) {
+    if (!is_mouse_button(event.key))
+      return false;
+
+    const auto it = std::find(g_buttons_down.begin(), g_buttons_down.begin(), event.key);
+    if (event.state == KeyState::Down) {
+      if (it != g_buttons_down.end())
+        return true;
+      g_buttons_down.push_back(event.key);
+    }
+    else if (it != g_buttons_down.end()) {
+      g_buttons_down.erase(it);
+    }
+    return false;
+  }
+
   std::optional<INPUT> make_button_input(const KeyEvent& event) {
     const auto down = (event.state == KeyState::Down);
     auto button = INPUT{ };
@@ -109,168 +126,48 @@ namespace {
     return button;
   }
 
-  bool is_control_up(const KeyEvent& event) {
-    return (event.state == KeyState::Up &&
-          (event.key == Key::ControlLeft ||
-           event.key == Key::ControlRight));
+  UINT to_milliseconds(Duration duration) {
+    return static_cast<UINT>(std::chrono::duration_cast<
+          std::chrono::milliseconds>(duration).count());
   }
 
-  void schedule_flush(Duration delay = { }) {
-    if (g_flush_scheduled)
-      return;
-    g_flush_scheduled = true;
-    SetTimer(g_window, TIMER_FLUSH_SEND_BUFFER,
-      static_cast<UINT>(std::chrono::duration_cast<
-        std::chrono::milliseconds>(delay).count()), 
-      nullptr);
-  }
+  bool ServerStateImpl::on_send_key(const KeyEvent& event) {
+    if (prevent_button_repeat(event))
+      return true;
 
-  void flush_send_buffer() {
-    if (g_sending_key)
-      return;
-    g_sending_key = true;
-    g_flush_scheduled = false;
-
-    auto i = size_t{ };
-    for (; i < g_send_buffer.size(); ++i) {
-      const auto& event = g_send_buffer[i];
-      const auto is_first = (i == 0);
-      const auto is_last = (i == g_send_buffer.size() - 1);
-
-      if (is_action_key(event.key)) {
-        if (event.state == KeyState::Down)
-          g_client.send_triggered_action(
-            static_cast<int>(*event.key - *Key::first_action));
-        continue;
-      }
-
-      // do not release Control too quickly
-      // otherwise copy/paste does not work in some input fields
-      if (!is_first && is_control_up(event)) {
-        schedule_flush(std::chrono::milliseconds(10));
-        break;
-      }
-
-      if (event.state == KeyState::Down) {
-        const auto delay = g_button_debouncer.on_key_down(event.key, !is_last);
-        if (delay != Duration::zero()) {
-          schedule_flush(delay);
-          break;
-        }
-      }
-
+    if (g_devices.initialized()) {
+      g_devices.send_input(event);
+    }
+    else{
       auto input = make_button_input(event);
       if (!input.has_value())
         input = make_key_input(event);
       ::SendInput(1, &input.value(), sizeof(INPUT));
     }
-    g_send_buffer.erase(g_send_buffer.begin(), g_send_buffer.begin() + i);
-    g_sending_key = false;
+    return true;
   }
 
-  void schedule_timeout(std::chrono::milliseconds timeout) {
-    g_timeout_ms = timeout;
-    g_timeout_start_at = Clock::now();
-    SetTimer(g_window, TIMER_TIMEOUT, 
-      static_cast<UINT>(timeout.count()),  nullptr);
+  void ServerStateImpl::on_flush_scheduled(Duration delay) {
+    ::SetTimer(g_window, TIMER_FLUSH_SEND_BUFFER,
+      to_milliseconds(delay), nullptr);
   }
 
-  void cancel_timeout() {
-    KillTimer(g_window, TIMER_TIMEOUT);
-    g_timeout_start_at.reset();
+  void ServerStateImpl::on_timeout_scheduled(Duration timeout) {
+    ::SetTimer(g_window, TIMER_TIMEOUT, 
+      to_milliseconds(timeout),  nullptr);
   }
 
-  void send_key_sequence(const KeySequence& key_sequence) {
-    auto* send_buffer = &g_send_buffer;
-    for (const auto& event : key_sequence)
-      if (event.state == KeyState::OutputOnRelease) {
-        send_buffer = &g_send_buffer_on_release;
-        g_output_on_release = true;
-      }
-      else {
-        send_buffer->push_back(event);
-      }
+  void ServerStateImpl::on_timeout_cancelled() {
+    ::KillTimer(g_window, TIMER_TIMEOUT);
   }
 
-  bool translate_input(KeyEvent input) {
-    // ignore key repeat while a flush or a timeout is pending
-    if (input == g_last_key_event && 
-          (g_flush_scheduled || g_timeout_start_at)) {
-      verbose_debug_io(input, { }, true);
-      return true;
-    }
-
-    auto cancelled_timeout = false;
-    if (g_timeout_start_at) {
-      // cancel current time out, inject event with elapsed time
-      const auto time_since_timeout_start = 
-        (Clock::now() - *g_timeout_start_at);
-      cancel_timeout();
-      translate_input(make_timeout_event(time_since_timeout_start));
-      cancelled_timeout = true;
-    }
-
-    // turn NumLock succeeding Pause into another Pause
-    auto translated_numlock_to_pause = false;
-    if (input.state == g_last_key_event.state && 
-        input.key == Key::NumLock && 
-        g_last_key_event.key == Key::Pause) {
-      input.key = Key::Pause;
-      translated_numlock_to_pause = true;
-    }
-    g_last_key_event = input;
-
-    // after OutputOnRelease block input until trigger is released
-    if (g_output_on_release) {
-      if (input.state != KeyState::Up)
-        return true;
-      g_send_buffer.insert(g_send_buffer.end(),
-        g_send_buffer_on_release.begin(), g_send_buffer_on_release.end());
-      g_send_buffer_on_release.clear();
-      g_output_on_release = false;
-    }
-
-    apply_updates();
-
-    const auto device_index = 0;
-    auto output = g_stage->update(input, device_index);
-
-    if (g_stage->should_exit()) {
-      verbose("Read exit sequence");
-      ::PostQuitMessage(0);
-      return true;
-    }
-
-    if (!output.empty() && output.back().key == Key::timeout) {
-      schedule_timeout(timeout_to_milliseconds(output.back().timeout));
-      output.pop_back();
-    }
-
-    const auto translated =
-        output.size() != 1 ||
-        output.front().key != input.key ||
-        (output.front().state == KeyState::Up) != (input.state == KeyState::Up) ||
-        translated_numlock_to_pause;
-
-    const auto intercept_and_send =
-        g_flush_scheduled ||
-        cancelled_timeout ||
-        translated ||
-        // always intercept and send AltGr
-        input.key == Key::AltRight;
-
-    verbose_debug_io(input, output, intercept_and_send);
-
-    if (intercept_and_send)
-      send_key_sequence(output);
-
-    g_stage->reuse_buffer(std::move(output));
-    return intercept_and_send;
+  void ServerStateImpl::on_exit_requested() {
+    ::DestroyWindow(g_window);
   }
 
   bool translate_keyboard_input(WPARAM wparam, const KBDLLHOOKSTRUCT& kbd) {
     const auto injected = (kbd.dwExtraInfo == injected_ident);
-    if (!kbd.scanCode || injected)
+    if (injected)
       return false;
 
     // ignore remote desktop input
@@ -279,34 +176,33 @@ namespace {
 
     const auto input = get_key_event(wparam, kbd);
     if (input.key == Key::none) {
-      verbose("0x%X", kbd.scanCode);
+      verbose("sc: 0x%X, vk: 0x%X", kbd.scanCode, kbd.vkCode);
 
       // ControlRight preceding AltGr, intercept when it was not sent
       const auto ControlRightPrecedingAltGr = 0x21D;
       if (kbd.scanCode == ControlRightPrecedingAltGr)
-        return !g_sending_key;
+        return !g_state.sending_key();
 
       return false;
     }
 
-    return translate_input(input);
+    return g_state.translate_input(input, Stage::no_device_index);
   }
 
   LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
       const auto& kbd = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(lparam);
       if (translate_keyboard_input(wparam, kbd)) {
-        if (!g_flush_scheduled)
-          flush_send_buffer();
+        if (!g_state.flush_scheduled_at())
+          g_state.flush_send_buffer();
         return -1;
       }
     }
     return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
   }
-  
+
   std::optional<KeyEvent> get_button_event(WPARAM wparam, const MSLLHOOKSTRUCT& ms) {
     auto state = KeyState::Down;
-    g_button_debouncer.on_mouse_move(ms.pt.x, ms.pt.y);
     auto key = Key::none;
     switch (wparam) {
       case WM_LBUTTONDOWN: key = Key::ButtonLeft; break;
@@ -328,21 +224,21 @@ namespace {
 
   bool translate_mouse_input(WPARAM wparam, const MSLLHOOKSTRUCT& ms) {
     const auto injected = (ms.dwExtraInfo == injected_ident);
-    if (injected || g_sending_key)
+    if (injected || g_state.sending_key())
       return false;
     
     const auto input = get_button_event(wparam, ms);
     if (!input.has_value())
       return false;
 
-    return translate_input(*input);
+    return g_state.translate_input(*input, Stage::no_device_index);
   }
 
   LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
       const auto& ms = *reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam);
       if (translate_mouse_input(wparam, ms)) {
-        schedule_flush();
+        g_state.schedule_flush();
         return -1;
       }
     }
@@ -358,17 +254,24 @@ namespace {
 
   void hook_devices() {
     unhook_devices();
-    verbose("Hooking devices");
+    
+    if (!g_devices.initialized()) {
+      g_keyboard_hook = SetWindowsHookExW(
+        WH_KEYBOARD_LL, &keyboard_hook_proc, g_instance, 0);
+      if (!g_keyboard_hook)
+        error("Hooking keyboard failed");
+    }
 
-    g_keyboard_hook = SetWindowsHookExW(
-      WH_KEYBOARD_LL, &keyboard_hook_proc, g_instance, 0);
-    if (!g_keyboard_hook)
-      error("Hooking keyboard failed");
-
-    g_mouse_hook = SetWindowsHookExW(
-      WH_MOUSE_LL, &mouse_hook_proc, g_instance, 0);
-    if (!g_mouse_hook)
-      error("Hooking mouse failed");
+#if !defined(NDEBUG)
+    // do not hook mouse while debugging
+    if (!IsDebuggerPresent())
+#endif
+    {
+      g_mouse_hook = SetWindowsHookExW(
+        WH_MOUSE_LL, &mouse_hook_proc, g_instance, 0);
+      if (!g_mouse_hook)
+        error("Hooking mouse failed");
+    }
   }
 
   int get_vk_by_key(Key key) {
@@ -383,103 +286,104 @@ namespace {
     }
   }
 
-  void validate_state() {
-    verbose("Validating state");
-    if (g_stage)
-      g_stage->validate_state([](Key key) {
-        return (GetAsyncKeyState(get_vk_by_key(key)) & 0x8000) != 0;
-      });
+  bool ServerStateImpl::on_validate_key_is_down(Key key) {
+    if (g_devices.initialized())
+      return true;
+    return (GetAsyncKeyState(get_vk_by_key(key)) & 0x8000) != 0;
   }
 
-  bool accept() {
-    if (!g_client.accept() ||
-        WSAAsyncSelect(g_client.socket(), g_window,
-          WM_APP_CLIENT_MESSAGE, (FD_READ | FD_CLOSE)) != 0) {
-      error("Connecting to keymapper failed");
-      return false;
-    }
-    verbose("Keymapper connected");
-    return true;
+  void ServerStateImpl::on_device_names_message() {
+    if (g_devices.initialized())
+      return ServerState::on_device_names_message();
+    return send_devices_error_message(g_devices.error_message());
   }
 
-  bool handle_client_message() {
-    return g_client.read_messages(Duration::zero(), [&](Deserializer& d) {
+  bool listen_for_client() {
+    auto socket = g_state.listen_for_client_connections();
+    return (socket && 
+      WSAAsyncSelect(*socket, g_window,
+        WM_APP_CLIENT_MESSAGE, FD_ACCEPT) == 0);
+  }
 
-      // cancel output on release when the focus changed
-      g_output_on_release = false;
-      g_send_buffer_on_release.clear();
-
-      const auto message_type = d.read<MessageType>();
-      if (message_type == MessageType::active_contexts) {
-        g_new_active_contexts = 
-          &g_client.read_active_contexts(d);
-      }
-      else if (message_type == MessageType::validate_state) {
-        validate_state();
-      }
-      else if (message_type == MessageType::configuration) {
-        g_new_stage = g_client.read_config(d);
-        if (!g_new_stage)
-          return error("Receiving configuration failed");
-
-        verbose("Configuration received");
-      }
-    });
+  bool accept_client() {
+    auto socket = g_state.accept_client_connection();
+    return (socket && 
+      WSAAsyncSelect(*socket, g_window,
+        WM_APP_CLIENT_MESSAGE, (FD_READ | FD_CLOSE)) == 0);
   }
 
   void apply_updates() {
-    // do not apply updates while a key is down
-    if (g_stage && g_stage->is_output_down())
-      return;
-
-    if (g_new_stage)
-      g_stage = std::move(g_new_stage);
-
-    if (g_new_active_contexts) {
-      g_stage->set_active_contexts(*g_new_active_contexts);
-      g_new_active_contexts = nullptr;
-
-      // reinsert hook in front of callchain
-      hook_devices();
-    }
+    // reinsert hook in front of callchain
+    hook_devices();
   }
 
   LRESULT CALLBACK window_proc(HWND window, UINT message,
       WPARAM wparam, LPARAM lparam) {
     switch(message) {
       case WM_DESTROY:
-        PostQuitMessage(0);
+        g_devices.shutdown();
+        ::PostQuitMessage(0);
         return 0;
 
       case WM_APP_CLIENT_MESSAGE:
         if (lparam == FD_ACCEPT) {
-          accept();
+          accept_client();
         }
         else if (lparam == FD_READ) {
-          if (handle_client_message()) {
+          if (g_state.read_client_messages(Duration::zero())) {
             apply_updates();
           }
           else {
-            g_client.disconnect();
+            g_state.disconnect();
           }
         }
         else {
           verbose("Connection to keymapper lost");
           verbose("---------------");
+          g_state.reset_configuration();
           unhook_devices();
         }
         return 0;
 
+      case WM_INPUT_DEVICE_CHANGE: {
+        const auto device = reinterpret_cast<HANDLE>(lparam);
+        if (wparam == GIDC_ARRIVAL)
+          g_devices.on_device_attached(device);
+        verbose("Device '%s' %s", 
+          g_devices.get_device_name(device).c_str(),
+          (wparam == GIDC_ARRIVAL ? "attached" : "removed"));
+        if (wparam == GIDC_REMOVAL)
+          g_devices.on_device_removed(device);
+        g_state.set_device_names(g_devices.device_names());
+        break;
+      }
+
+      case WM_APP_DEVICE_INPUT: {
+        const auto event = KeyEvent{ 
+          static_cast<Key>(LOWORD(wparam)), 
+          static_cast<KeyState>(HIWORD(wparam)) 
+        };
+        const auto device = reinterpret_cast<HANDLE>(lparam);
+        const auto device_index = g_devices.get_device_index(device);
+        if (g_state.translate_input(event, device_index)) {
+          if (!g_state.flush_scheduled_at())
+            g_state.flush_send_buffer();
+          return 1;
+        }
+        return 0;
+      }
+
       case WM_TIMER: {
         if (wparam == TIMER_FLUSH_SEND_BUFFER) {
           KillTimer(g_window, TIMER_FLUSH_SEND_BUFFER);
-          flush_send_buffer();
+          g_state.flush_send_buffer();
         }
         else if (wparam == TIMER_TIMEOUT) {
-          cancel_timeout();
-          translate_input(make_timeout_event(g_timeout_ms));
-          if (!g_flush_scheduled)
-            flush_send_buffer();
+          const auto timeout = make_input_timeout_event(g_state.timeout());
+          g_state.cancel_timeout();
+          g_state.translate_input(timeout, Stage::any_device_index);
+          if (!g_state.flush_scheduled_at())
+            g_state.flush_send_buffer();
         }
         break;
       }
@@ -508,6 +412,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     return 1;
   }
 
+  g_state.reset_configuration();
+
   SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
   g_instance = instance;
   g_verbose_output = settings.verbose;
@@ -525,18 +431,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
     HWND_MESSAGE, NULL, NULL,  NULL);
   
+  g_devices.initialize(g_window, WM_APP_DEVICE_INPUT);
+
   auto disable = BOOL{ FALSE };
   SetUserObjectInformationA(GetCurrentProcess(),
     UOI_TIMERPROC_EXCEPTION_SUPPRESSION, &disable, sizeof(disable));
 
-  if (!g_client.initialize() ||
-      WSAAsyncSelect(g_client.listen_socket(), g_window,
-        WM_APP_CLIENT_MESSAGE, FD_ACCEPT) != 0) {
-    error("Initializing keymapper connection failed");
+  if (!listen_for_client())
     return 1;
-  }
 
-  verbose("Entering update loop");
   auto message = MSG{ };
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {
     TranslateMessage(&message);

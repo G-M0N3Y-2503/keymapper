@@ -19,19 +19,20 @@ enum class KeyState : uint16_t {
   DownAsync,       // only in input expression
   OutputOnRelease, // only in output expression
   DownMatched,     // only in sequence
+
+  // only in input timeout events (mostly renaming standard states)
+  NotTimeout_cancel_on_up_down,
+  NotTimeout_cancel_on_down  = Not,
+  Timeout_cancel_on_up_down  = Up,
+  Timeout_cancel_on_down     = Down,
 };
 
 struct KeyEvent {
   static const int timeout_bits = 12;
 
   Key key;
-  union {
-    uint16_t data;
-    struct {
-      KeyState state   : 4;
-      uint16_t timeout : timeout_bits;
-    };
-  };
+  KeyState state   : 4;
+  uint16_t timeout : timeout_bits;
 
   KeyEvent()
     : key(), state(), timeout() {
@@ -49,6 +50,21 @@ struct KeyEvent {
     return !(*this == b);
   }
 };
+static_assert(sizeof(KeyEvent) == 4, "unexpected padding");
+
+inline bool is_not_timeout(KeyState state) {
+  return (state == KeyState::NotTimeout_cancel_on_down || 
+          state == KeyState::NotTimeout_cancel_on_up_down);
+}
+
+inline bool cancel_timeout_on_up(KeyState state) {
+  return (state == KeyState::NotTimeout_cancel_on_up_down || 
+          state == KeyState::Timeout_cancel_on_up_down);
+}
+
+inline bool is_not_timeout(const KeyEvent& event) {
+  return (event.key == Key::timeout && is_not_timeout(event.state));
+}
 
 class KeySequence : public std::vector<KeyEvent> {
 public:
@@ -77,7 +93,7 @@ public:
   const Iterator& end() const { return m_end; }
   bool empty() const { return m_begin == m_end; }
   size_t size() const { return m_end - m_begin; }
-  auto operator[](size_t index) const { return *(m_begin + index); }
+  decltype(auto) operator[](size_t index) const { return *(m_begin + index); }
   void pop_back() { --m_end; }
 
 private:

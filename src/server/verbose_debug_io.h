@@ -1,10 +1,11 @@
 #pragma once
 
 #if !defined(NDEBUG)
-#include "common/output.h"
+# include "common/output.h"
 # include "runtime/KeyEvent.h"
 # include "runtime/Timeout.h"
-# include "config/get_key_name.cpp"
+# include "config/get_key_name.h"
+# include <sstream>
 
 void verbose_debug_io(const KeyEvent& input,
     const KeySequence& output, bool translated) {
@@ -15,8 +16,12 @@ void verbose_debug_io(const KeyEvent& input,
         std::to_string(timeout_to_milliseconds(e.timeout).count()) + "ms";
 
     const auto key_name = [](Key key) {
-      const auto name = get_key_name(key);
-      return std::string(name ? name : "???");
+      if (const auto name = get_key_name(key))
+        return std::string(name);
+
+      auto ss = std::stringstream();
+      ss << std::hex << std::uppercase << *key;
+      return ss.str();
     };
     return (e.state == KeyState::Down ? "+" :
             e.state == KeyState::Up ? "-" : "*") + key_name(e.key);
